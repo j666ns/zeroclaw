@@ -13,7 +13,7 @@
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ToolCall as ProviderToolCall,
+    Provider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -134,6 +134,16 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,6 +313,43 @@ impl CopilotProvider {
             .collect()
     }
 
+    fn merge_response_choices(
+        choices: Vec<Choice>,
+    ) -> anyhow::Result<(Option<String>, Vec<ProviderToolCall>)> {
+        if choices.is_empty() {
+            return Err(anyhow::anyhow!("No response from GitHub Copilot"));
+        }
+
+        // Keep the first non-empty text response and aggregate tool calls from every choice.
+        let mut text = None;
+        let mut tool_calls = Vec::new();
+
+        for choice in choices {
+            let ResponseMessage {
+                content,
+                tool_calls: choice_tool_calls,
+            } = choice.message;
+
+            if text.is_none() {
+                if let Some(content) = content.filter(|value| !value.is_empty()) {
+                    text = Some(content);
+                }
+            }
+
+            for tool_call in choice_tool_calls.unwrap_or_default() {
+                tool_calls.push(ProviderToolCall {
+                    id: tool_call
+                        .id
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name: tool_call.function.name,
+                    arguments: tool_call.function.arguments,
+                });
+            }
+        }
+
+        Ok((text, tool_calls))
+    }
+
     /// Send a chat completions request with required Copilot headers.
     async fn send_chat_request(
         &self,
@@ -340,29 +387,21 @@ impl CopilotProvider {
         }
 
         let api_response: ApiChatResponse = response.json().await?;
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No response from GitHub Copilot"))?;
-
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tool_call| ProviderToolCall {
-                id: tool_call
-                    .id
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name: tool_call.function.name,
-                arguments: tool_call.function.arguments,
-            })
-            .collect();
+        let usage = api_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+        // Copilot may split text and tool calls across multiple choices.
+        let (text, tool_calls) = Self::merge_response_choices(api_response.choices)?;
 
         Ok(ProviderChatResponse {
-            text: choice.message.content,
+            text,
             tool_calls,
+            usage,
+            reasoning_content: None,
+            quota_metadata: None,
+            stop_reason: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -699,5 +738,99 @@ mod tests {
     fn supports_native_tools() {
         let provider = CopilotProvider::new(None);
         assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn api_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 200, "completion_tokens": 80}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(200));
+        assert_eq!(usage.completion_tokens, Some(80));
+    }
+
+    #[test]
+    fn api_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
+    }
+
+    #[test]
+    fn merge_response_choices_merges_tool_calls_across_choices() {
+        let choices = vec![
+            Choice {
+                message: ResponseMessage {
+                    content: Some("Let me check".to_string()),
+                    tool_calls: None,
+                },
+            },
+            Choice {
+                message: ResponseMessage {
+                    content: None,
+                    tool_calls: Some(vec![
+                        NativeToolCall {
+                            id: Some("tool-1".to_string()),
+                            kind: Some("function".to_string()),
+                            function: NativeFunctionCall {
+                                name: "get_time".to_string(),
+                                arguments: "{}".to_string(),
+                            },
+                        },
+                        NativeToolCall {
+                            id: Some("tool-2".to_string()),
+                            kind: Some("function".to_string()),
+                            function: NativeFunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: r#"{"path":"notes.txt"}"#.to_string(),
+                            },
+                        },
+                    ]),
+                },
+            },
+        ];
+
+        let (text, tool_calls) = CopilotProvider::merge_response_choices(choices).unwrap();
+        assert_eq!(text.as_deref(), Some("Let me check"));
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "tool-1");
+        assert_eq!(tool_calls[1].id, "tool-2");
+    }
+
+    #[test]
+    fn merge_response_choices_prefers_first_non_empty_text() {
+        let choices = vec![
+            Choice {
+                message: ResponseMessage {
+                    content: Some(String::new()),
+                    tool_calls: None,
+                },
+            },
+            Choice {
+                message: ResponseMessage {
+                    content: Some("First".to_string()),
+                    tool_calls: None,
+                },
+            },
+            Choice {
+                message: ResponseMessage {
+                    content: Some("Second".to_string()),
+                    tool_calls: None,
+                },
+            },
+        ];
+
+        let (text, tool_calls) = CopilotProvider::merge_response_choices(choices).unwrap();
+        assert_eq!(text.as_deref(), Some("First"));
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn merge_response_choices_rejects_empty_choice_list() {
+        let error = CopilotProvider::merge_response_choices(Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("No response"));
     }
 }

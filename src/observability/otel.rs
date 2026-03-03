@@ -21,6 +21,7 @@ pub struct OtelObserver {
     tool_calls: Counter<u64>,
     tool_duration: Histogram<f64>,
     channel_messages: Counter<u64>,
+    webhook_auth_failures: Counter<u64>,
     heartbeat_ticks: Counter<u64>,
     errors: Counter<u64>,
     request_latency: Histogram<f64>,
@@ -35,13 +36,15 @@ impl OtelObserver {
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
-        let endpoint = endpoint.unwrap_or("http://localhost:4318");
+        let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
+        let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
+        let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&traces_endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -59,7 +62,7 @@ impl OtelObserver {
         // ── Metric exporter ─────────────────────────────────────
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&metrics_endpoint)
             .build()
             .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
 
@@ -119,6 +122,11 @@ impl OtelObserver {
             .with_description("Total channel messages")
             .build();
 
+        let webhook_auth_failures = meter
+            .u64_counter("zeroclaw.webhook.auth.failures")
+            .with_description("Total webhook authentication failures")
+            .build();
+
         let heartbeat_ticks = meter
             .u64_counter("zeroclaw.heartbeat.ticks")
             .with_description("Total heartbeat ticks")
@@ -160,6 +168,7 @@ impl OtelObserver {
             tool_calls,
             tool_duration,
             channel_messages,
+            webhook_auth_failures,
             heartbeat_ticks,
             errors,
             request_latency,
@@ -193,6 +202,8 @@ impl Observer for OtelObserver {
                 duration,
                 success,
                 error_message: _,
+                input_tokens: _,
+                output_tokens: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -312,6 +323,20 @@ impl Observer for OtelObserver {
                     ],
                 );
             }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                self.webhook_auth_failures.add(
+                    1,
+                    &[
+                        KeyValue::new("channel", channel.clone()),
+                        KeyValue::new("signature", signature.clone()),
+                        KeyValue::new("bearer", bearer.clone()),
+                    ],
+                );
+            }
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.add(1, &[]);
             }
@@ -411,6 +436,8 @@ mod tests {
             duration: Duration::from_millis(250),
             success: true,
             error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -489,6 +516,8 @@ mod tests {
             duration: Duration::from_millis(0),
             success: false,
             error_message: Some("404 Not Found".into()),
+            input_tokens: None,
+            output_tokens: None,
         });
     }
 

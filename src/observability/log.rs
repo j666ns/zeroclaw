@@ -44,6 +44,18 @@ impl Observer for LogObserver {
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
+            ObserverEvent::WebhookAuthFailure {
+                channel,
+                signature,
+                bearer,
+            } => {
+                info!(
+                    channel = %channel,
+                    signature = %signature,
+                    bearer = %bearer,
+                    "webhook.auth.failure"
+                );
+            }
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }
@@ -68,6 +80,8 @@ impl Observer for LogObserver {
                 duration,
                 success,
                 error_message,
+                input_tokens,
+                output_tokens,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(
@@ -76,6 +90,8 @@ impl Observer for LogObserver {
                     duration_ms = ms,
                     success = success,
                     error = ?error_message,
+                    input_tokens = ?input_tokens,
+                    output_tokens = ?output_tokens,
                     "llm.response"
                 );
             }
@@ -140,6 +156,24 @@ mod tests {
             tokens_used: None,
             cost_usd: None,
         });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(150),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(200),
+            success: false,
+            error_message: Some("rate limited".into()),
+            input_tokens: None,
+            output_tokens: None,
+        });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
@@ -148,6 +182,11 @@ mod tests {
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "outbound".into(),
+        });
+        obs.record_event(&ObserverEvent::WebhookAuthFailure {
+            channel: "wati".into(),
+            signature: "invalid".into(),
+            bearer: "missing".into(),
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {

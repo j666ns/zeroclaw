@@ -51,7 +51,7 @@ impl TokenSet {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
     pub provider: String,
@@ -69,6 +69,21 @@ pub struct AuthProfile {
     pub metadata: BTreeMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AuthProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthProfile")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("profile_name", &self.profile_name)
+            .field("kind", &self.kind)
+            .field("workspace_id", &self.workspace_id)
+            .field("metadata", &self.metadata)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthProfile {
@@ -229,6 +244,39 @@ impl AuthProfilesStore {
         data.updated_at = Utc::now();
         self.save_locked(&data).await?;
         Ok(updated_profile)
+    }
+
+    /// Update quota metadata for an auth profile.
+    ///
+    /// This is typically called after a successful or rate-limited API call
+    /// to persist quota information (remaining requests, reset time, etc.).
+    pub async fn update_quota_metadata(
+        &self,
+        profile_id: &str,
+        rate_limit_remaining: Option<u64>,
+        rate_limit_reset_at: Option<DateTime<Utc>>,
+        rate_limit_total: Option<u64>,
+    ) -> Result<()> {
+        self.update_profile(profile_id, |profile| {
+            if let Some(remaining) = rate_limit_remaining {
+                profile
+                    .metadata
+                    .insert("rate_limit_remaining".to_string(), remaining.to_string());
+            }
+            if let Some(reset_at) = rate_limit_reset_at {
+                profile
+                    .metadata
+                    .insert("rate_limit_reset_at".to_string(), reset_at.to_rfc3339());
+            }
+            if let Some(total) = rate_limit_total {
+                profile
+                    .metadata
+                    .insert("rate_limit_total".to_string(), total.to_string());
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     async fn load_locked(&self) -> Result<AuthProfilesData> {

@@ -116,7 +116,8 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
+        let (success, output) =
+            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         let status = if success { "ok" } else { "error" };
@@ -249,5 +250,29 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);
+    }
+
+    #[tokio::test]
+    async fn blocks_run_when_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::Full;
+        config.autonomy.max_actions_per_hour = 0;
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo run-now").unwrap();
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("Rate limit exceeded"));
+        assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
     }
 }

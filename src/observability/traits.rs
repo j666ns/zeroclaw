@@ -26,6 +26,8 @@ pub enum ObserverEvent {
         duration: Duration,
         success: bool,
         error_message: Option<String>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     /// The agent session has finished.
     ///
@@ -53,6 +55,15 @@ pub enum ObserverEvent {
         channel: String,
         /// `"inbound"` or `"outbound"`.
         direction: String,
+    },
+    /// Webhook authentication failure with non-sensitive auth states.
+    WebhookAuthFailure {
+        /// Channel name (e.g., `"wati"`, `"whatsapp"`).
+        channel: String,
+        /// Signature auth status (`"missing"`, `"invalid"`, `"valid"`).
+        signature: String,
+        /// Bearer auth status (`"missing"`, `"invalid"`, `"valid"`).
+        bearer: String,
     },
     /// Periodic heartbeat tick from the runtime keep-alive loop.
     HeartbeatTick,
